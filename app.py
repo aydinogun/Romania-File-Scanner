@@ -16,6 +16,8 @@ import requests
 import pdfplumber
 import streamlit as st
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 BASE = "https://cetatenie.just.ro"
 
@@ -33,8 +35,22 @@ HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                    "Chrome/124.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ro,en;q=0.8,tr;q=0.6",
+    "Connection": "keep-alive",
 }
 TIMEOUT = 30
+
+
+def make_session() -> requests.Session:
+    """Yeniden deneme (retry) destekli ortak oturum."""
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    retry = Retry(total=3, backoff_factor=1,
+                  status_forcelist=[429, 500, 502, 503, 504])
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://", HTTPAdapter(max_retries=retry))
+    return s
 
 # --- Regex desenleri --------------------------------------------------------
 RE_DATE  = re.compile(r"\b\d{1,2}\.\d{1,2}\.\d{4}\b")            # 15.03.2024
@@ -46,28 +62,39 @@ RE_YEAR  = re.compile(r"(20\d{2})")
 # 1) Bütün kaynak sayfalardaki PDF linklerini topla
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
-def discover_all_pdfs() -> list[dict]:
-    pdfs, seen = [], set()
+def discover_all_pdfs() -> dict:
+    """
+    Bütün kaynak sayfalardaki PDF linklerini toplar.
+    Dönüş: {"pdfs": [...], "report": [(sayfa, durum), ...]}
+    'report' her sayfanın sonucunu içerir (teşhis için).
+    """
+    session = make_session()
+    pdfs, seen, report = [], set(), []
     for page in SOURCE_PAGES:
         try:
-            r = requests.get(page, headers=HEADERS, timeout=TIMEOUT)
-            r.raise_for_status()
-        except Exception:
-            continue
-        soup = BeautifulSoup(r.text, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if not href.lower().endswith(".pdf"):
+            r = session.get(page, timeout=TIMEOUT)
+            count_before = len(pdfs)
+            if r.status_code != 200:
+                report.append((page, f"HTTP {r.status_code}"))
                 continue
-            if href.startswith("/"):
-                href = BASE + href
-            if href in seen:
-                continue
-            seen.add(href)
-            name = href.split("/")[-1]
-            m = RE_YEAR.search(name) or RE_YEAR.search(href)
-            pdfs.append({"url": href, "name": name, "year": m.group(1) if m else "?"})
-    return pdfs
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                if not href.lower().endswith(".pdf"):
+                    continue
+                if href.startswith("/"):
+                    href = BASE + href
+                if href in seen:
+                    continue
+                seen.add(href)
+                name = href.split("/")[-1]
+                m = RE_YEAR.search(name) or RE_YEAR.search(href)
+                pdfs.append({"url": href, "name": name,
+                             "year": m.group(1) if m else "?"})
+            report.append((page, f"OK · {len(pdfs) - count_before} PDF"))
+        except Exception as e:
+            report.append((page, f"HATA: {type(e).__name__}: {e}"))
+    return {"pdfs": pdfs, "report": report}
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +102,7 @@ def discover_all_pdfs() -> list[dict]:
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_pdf_text(pdf_url: str) -> str:
-    r = requests.get(pdf_url, headers=HEADERS, timeout=TIMEOUT)
+    r = make_session().get(pdf_url, timeout=TIMEOUT)
     r.raise_for_status()
     raw = r.content
     parts = []
@@ -138,9 +165,19 @@ st.caption("Dosya numaranızı girin. Sistem maddeyi kendisi tespit eder ve "
 dossier = st.text_input("Dosya numarası", placeholder="örn. 8620/RD/2022")
 
 if st.button("🔎 Sorgula", type="primary", disabled=not dossier.strip()):
-    pdfs = discover_all_pdfs()
+    result = discover_all_pdfs()
+    pdfs = result["pdfs"]
+
     if not pdfs:
-        st.error("Kaynak sayfalara ulaşılamadı. Daha sonra tekrar deneyin.")
+        st.error("Kaynak sayfalara ulaşılamadı. Aşağıdaki teşhis raporuna bakın:")
+        for page, status in result["report"]:
+            st.write(f"- `{page}` → {status}")
+        st.info(
+            "Eğer durumlar 'HTTP 403' veya zaman aşımı/bağlantı hatası gösteriyorsa, "
+            "site büyük ihtimalle Streamlit Cloud'un sunucu IP'sini engelliyordur. "
+            "Bu durumda uygulamayı kendi bilgisayarında (`streamlit run app.py`) "
+            "çalıştırırsan sorunsuz erişir."
+        )
         st.stop()
 
     # Numaradaki yılı yakala -> sadece o yılın dosyalarını tara (hızlı + isabetli)
