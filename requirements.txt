@@ -1,0 +1,9 @@
+streamlit>=1.33
+requests>=2.31
+beautifulsoup4>=4.12
+pdfplumber>=0.11
+
+# --- OCR (sadece taranmış PDF'ler için, opsiyonel) ---
+# Bunları açarsan packages.txt'i de eklemeyi unutma.
+pdf2image>=1.17
+pytesseract>=0.3.10
