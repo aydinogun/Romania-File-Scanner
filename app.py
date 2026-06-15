@@ -1,16 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-cetatenie.just.ro — Dosar (Dosya) Arama Motoru
-================================================
-ANC'nin (Autoritatea Națională pentru Cetățenie) "Stadiu Dosar" bölümünde
-maddeye ve yıla göre yayınlanan PDF'lerin içinde DOSYA NUMARASI arar.
+ANC Dosar Sorgulama
+===================
+Kullanıcı SADECE dosya numarasını girer. Madde seçmez.
+Sistem girilen numaradan kayıt yılını çıkarır, o yılın bütün madde
+(art. 8 / 8^1 / 10 / 11) "stadiu dosar" PDF'lerini tarar ve sonucu verir:
 
-Boru hattı (pipeline):
-  1) Linkleri keşfet  -> madde sayfasındaki PDF linklerini topla (BeautifulSoup)
-  2) PDF'i indir       -> requests (önbellekli)
-  3) Metni çıkar       -> pdfplumber (taranmış PDF için OCR opsiyonel)
-  4) Ara               -> dosya numarasını normalize edip regex ile bul
-  5) Sonucu göster     -> eşleşen satır(lar) + indirme linki
+  - SOLUȚIE doluysa  -> Ordin numarası (dosya çözülmüş)
+  - SOLUȚIE boşsa    -> TERMEN tarihi (komisyon tarihi, işlemde)
 """
 
 import io
@@ -20,184 +17,171 @@ import pdfplumber
 import streamlit as st
 from bs4 import BeautifulSoup
 
-# ---------------------------------------------------------------------------
-# 0) SABİTLER
-# ---------------------------------------------------------------------------
 BASE = "https://cetatenie.just.ro"
 
-# Her kanun maddesi -> ANC'deki "ordine" liste sayfası.
-# Aşağıdaki adresler 15.06.2026 itibarıyla siteden teyit edildi.
-ARTICLE_PAGES = {
-    "Art. 11 (redobândire)":     f"{BASE}/ordine-articolul-1-1/",
-    "Art. 10 (redobândire)":     f"{BASE}/ordine-articolul-10/",
-    "Art. 8 (acordare)":         f"{BASE}/ordine-articolul-8/",
-    "Art. 8^1 (acordare)":       f"{BASE}/ordine-articolul-8-indice-1/",
-}
+# Tüm "stadiu dosar" PDF'lerinin linklendiği sayfalar.
+# Hepsi taranır; kullanıcı madde seçmez.
+SOURCE_PAGES = [
+    f"{BASE}/stadiu-dosar/",
+    f"{BASE}/ordine-articolul-1-1/",        # art. 11
+    f"{BASE}/ordine-articolul-10/",         # art. 10
+    f"{BASE}/ordine-articolul-8/",          # art. 8
+    f"{BASE}/ordine-articolul-8-indice-1/", # art. 8^1
+]
 
 HEADERS = {
-    # Bot gibi görünmemek için gerçek bir tarayıcı User-Agent'ı kullan
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                    "Chrome/124.0 Safari/537.36"),
 }
 TIMEOUT = 30
 
+# --- Regex desenleri --------------------------------------------------------
+RE_DATE  = re.compile(r"\b\d{1,2}\.\d{1,2}\.\d{4}\b")            # 15.03.2024
+RE_ORDER = re.compile(r"\b\d{1,6}\s*/\s*(?:RD|P|A|RE|R)\s*/\s*\d{4}\b", re.I)
+RE_YEAR  = re.compile(r"(20\d{2})")
+
 
 # ---------------------------------------------------------------------------
-# 1) LİNK KEŞFİ — madde sayfasındaki PDF linklerini topla
+# 1) Bütün kaynak sayfalardaki PDF linklerini topla
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
-def discover_pdf_links(page_url: str) -> list[dict]:
-    """
-    Bir madde sayfasını çekip içindeki tüm PDF linklerini döndürür.
-    Çıktı: [{"url": "...", "name": "...", "year": "2024"}, ...]
-    """
-    r = requests.get(page_url, headers=HEADERS, timeout=TIMEOUT)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    links = []
-    seen = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if not href.lower().endswith(".pdf"):
+def discover_all_pdfs() -> list[dict]:
+    pdfs, seen = [], set()
+    for page in SOURCE_PAGES:
+        try:
+            r = requests.get(page, headers=HEADERS, timeout=TIMEOUT)
+            r.raise_for_status()
+        except Exception:
             continue
-        # Göreli linkleri tam URL'ye çevir
-        if href.startswith("/"):
-            href = BASE + href
-        if href in seen:
-            continue
-        seen.add(href)
-
-        name = href.split("/")[-1]
-        # Dosya adından ya da URL yolundan yıl yakala (2017–2026)
-        m = re.search(r"(20\d{2})", name) or re.search(r"/(20\d{2})/", href)
-        year = m.group(1) if m else "?"
-        links.append({"url": href, "name": name, "year": year})
-
-    # Yıla göre tersten sırala (en yeni üstte)
-    links.sort(key=lambda x: x["year"], reverse=True)
-    return links
+        soup = BeautifulSoup(r.text, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if not href.lower().endswith(".pdf"):
+                continue
+            if href.startswith("/"):
+                href = BASE + href
+            if href in seen:
+                continue
+            seen.add(href)
+            name = href.split("/")[-1]
+            m = RE_YEAR.search(name) or RE_YEAR.search(href)
+            pdfs.append({"url": href, "name": name, "year": m.group(1) if m else "?"})
+    return pdfs
 
 
 # ---------------------------------------------------------------------------
-# 2) İNDİR + 3) METİN ÇIKAR  (ikisi birlikte önbelleğe alınır)
+# 2) PDF indir + metin çıkar (gerekirse OCR)
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_pdf_text(pdf_url: str) -> str:
-    """
-    PDF'i indirir ve içindeki metni döndürür.
-    Önce pdfplumber ile dener (metin tabanlı PDF'ler için hızlı ve yeterli).
-    Hiç metin çıkmazsa PDF taranmış (resim) demektir -> OCR gerekir (opsiyonel).
-    """
     r = requests.get(pdf_url, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
     raw = r.content
-
-    text_parts = []
+    parts = []
     with pdfplumber.open(io.BytesIO(raw)) as pdf:
         for page in pdf.pages:
-            text_parts.append(page.extract_text() or "")
-    text = "\n".join(text_parts)
-
-    # Metin tabanlı PDF'lerin neredeyse tamamı buradan döner.
+            parts.append(page.extract_text() or "")
+    text = "\n".join(parts)
     if text.strip():
         return text
-
-    # --- OCR YEDEĞİ (taranmış/resim PDF'ler için) ---------------------------
-    # Streamlit Cloud'da çalışması için packages.txt'e poppler-utils + tesseract
-    # eklemen gerekir (aşağıdaki README'ye bak). Kurulu değilse boş döner.
+    # OCR yedeği (taranmış PDF)
     try:
         from pdf2image import convert_from_bytes
         import pytesseract
-        images = convert_from_bytes(raw, dpi=200)
-        ocr = [pytesseract.image_to_string(img, lang="ron") for img in images]
-        return "\n".join(ocr)
+        imgs = convert_from_bytes(raw, dpi=200)
+        return "\n".join(pytesseract.image_to_string(i, lang="ron") for i in imgs)
     except Exception:
-        return ""  # OCR yoksa sessizce boş geç
+        return ""
 
 
 # ---------------------------------------------------------------------------
-# 4) ARAMA — dosya numarasını normalize edip metinde bul
+# 3) Eşleştirme + TERMEN / SOLUȚIE ayrıştırma
 # ---------------------------------------------------------------------------
 def normalize(s: str) -> str:
-    """Boşluk, nokta, tireleri at; büyük harfe çevir. 8620/RD/2022 -> 8620RD2022"""
     return re.sub(r"[\s./\-]", "", s).upper()
 
 
-def search_in_text(text: str, dossier: str) -> list[str]:
-    """
-    Metni satır satır gezer; normalize edilmiş dosya numarasını içeren
-    satırları döndürür. Hem '8620/RD/2022' hem '8620 / RD / 2022' yakalanır.
-    """
+def parse_row(line: str, dossier: str) -> dict:
+    """Eşleşen satırı çözümle: termen tarihi ve soluție (ordin) ayır."""
     target = normalize(dossier)
-    hits = []
+    dates = RE_DATE.findall(line)
+    # Satırdaki tüm 'ordin benzeri' tokenlar; dosyanın kendisini çıkar
+    orders = [t for t in RE_ORDER.findall(line) if normalize(t) != target]
+
+    if orders:                       # SOLUȚIE dolu -> çözülmüş
+        return {"status": "solved", "solutie": orders[0],
+                "termen": dates[0] if dates else None, "raw": line.strip()}
+    if dates:                        # SOLUȚIE boş, TERMEN var -> işlemde
+        return {"status": "pending", "solutie": None,
+                "termen": dates[0], "raw": line.strip()}
+    return {"status": "unknown", "solutie": None, "termen": None, "raw": line.strip()}
+
+
+def search_pdf(text: str, dossier: str) -> list[dict]:
+    target = normalize(dossier)
+    out = []
     for line in text.splitlines():
         if target and target in normalize(line):
-            clean = line.strip()
-            if clean:
-                hits.append(clean)
-    return hits
+            out.append(parse_row(line, dossier))
+    return out
 
 
 # ---------------------------------------------------------------------------
-# 5) STREAMLIT ARAYÜZÜ
+# 4) Arayüz — tek kutu, tek buton
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="ANC Dosar Arama", page_icon="🇷🇴", layout="centered")
-st.title("🇷🇴 ANC Dosar (Dosya) Arama")
-st.caption("cetatenie.just.ro üzerindeki resmi PDF'lerde dosya numaranızı arar.")
+st.set_page_config(page_title="ANC Dosar Sorgulama", page_icon="🇷🇴", layout="centered")
+st.title("🇷🇴 ANC Dosar Sorgulama")
+st.caption("Dosya numaranızı girin. Sistem maddeyi kendisi tespit eder ve "
+           "Soluție (ordin) veya Termen (tarih) sonucunu verir.")
 
-with st.sidebar:
-    st.header("Ayarlar")
-    article = st.selectbox("Kanun maddesi", list(ARTICLE_PAGES.keys()))
-    st.divider()
-    st.markdown(
-        "Veri kaynağı: **Autoritatea Națională pentru Cetățenie**\n\n"
-        "Bu araç sadece resmi olarak yayımlanmış PDF'leri okur."
-    )
-
-# Seçilen maddenin PDF listesini keşfet
-page_url = ARTICLE_PAGES[article]
-try:
-    pdfs = discover_pdf_links(page_url)
-except Exception as e:
-    st.error(f"Liste sayfasına ulaşılamadı: {e}")
-    st.stop()
-
-if not pdfs:
-    st.warning("Bu sayfada PDF linki bulunamadı. Slug değişmiş olabilir, kontrol et.")
-    st.stop()
-
-# Tek kutu, tek buton — bütün yıllar otomatik taranır
 dossier = st.text_input("Dosya numarası", placeholder="örn. 8620/RD/2022")
-year_span = ", ".join(sorted({p["year"] for p in pdfs}, reverse=True))
-st.caption(f"Bu maddede {len(pdfs)} PDF var ({year_span}). Hepsi taranacak.")
 
-if st.button("🔎 Tüm yıllarda ara", type="primary", disabled=not dossier.strip()):
-    found_any = False
+if st.button("🔎 Sorgula", type="primary", disabled=not dossier.strip()):
+    pdfs = discover_all_pdfs()
+    if not pdfs:
+        st.error("Kaynak sayfalara ulaşılamadı. Daha sonra tekrar deneyin.")
+        st.stop()
+
+    # Numaradaki yılı yakala -> sadece o yılın dosyalarını tara (hızlı + isabetli)
+    ym = RE_YEAR.search(dossier)
+    if ym:
+        target_year = ym.group(1)
+        scan = [p for p in pdfs if p["year"] == target_year] or pdfs
+        st.caption(f"Kayıt yılı {target_year} tespit edildi · {len(scan)} PDF taranıyor.")
+    else:
+        scan = pdfs
+        st.caption(f"Yıl tespit edilemedi · {len(scan)} PDF taranıyor.")
+
+    found = False
     progress = st.progress(0.0)
-    for i, pdf in enumerate(pdfs, start=1):
-        progress.progress(i / len(pdfs))
+    for i, pdf in enumerate(scan, start=1):
+        progress.progress(i / len(scan))
         try:
             text = fetch_pdf_text(pdf["url"])
-        except Exception as e:
-            st.warning(f"{pdf['name']} okunamadı: {e}")
+        except Exception:
             continue
-
-        hits = search_in_text(text, dossier)
-        if hits:
-            found_any = True
+        for row in search_pdf(text, dossier):
+            found = True
             with st.container(border=True):
-                st.success(f"✅ Bulundu — {pdf['name']} ({pdf['year']})")
-                for h in hits:
-                    st.code(h, language=None)
+                if row["status"] == "solved":
+                    st.success(f"✅ ÇÖZÜLDÜ — Ordin (Soluție): **{row['solutie']}**")
+                    if row["termen"]:
+                        st.write(f"Termen (komisyon tarihi): {row['termen']}")
+                elif row["status"] == "pending":
+                    st.warning(f"⏳ İŞLEMDE — Termen (komisyon tarihi): **{row['termen']}**")
+                    st.write("Soluție sütunu henüz boş (ordin verilmemiş).")
+                else:
+                    st.info("Eşleşme bulundu, sütunlar otomatik ayrıştırılamadı.")
+                st.caption(f"Kaynak: {pdf['name']}")
+                st.code(row["raw"], language=None)
                 st.markdown(f"[PDF'i aç]({pdf['url']})")
     progress.empty()
 
-    if not found_any:
+    if not found:
         st.info(
             "Bu numara taranan PDF'lerde bulunamadı. Olası nedenler:\n"
-            "- Dosya henüz bir 'ordin'e bağlanmamış (işlemde),\n"
-            "- Yanlış madde seçildi (10 / 11 / 8 / 8¹),\n"
-            "- PDF taranmış (resim) ve OCR kapalı."
+            "- Dosya henüz listeye girmemiş (çok yeni kayıt),\n"
+            "- Numara/yıl yanlış yazıldı,\n"
+            "- İlgili PDF taranmış (resim) ve OCR kapalı."
         )
